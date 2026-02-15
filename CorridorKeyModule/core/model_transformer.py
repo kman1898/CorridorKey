@@ -1,0 +1,376 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+import math
+from .point_rend import PointRendModule, point_sample, calculate_uncertainty
+
+class MLP(nn.Module):
+    """
+    Linear Embedding: C_in -> C_out
+    """
+    def __init__(self, input_dim=2048, embed_dim=768):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, embed_dim)
+
+    def forward(self, x):
+        return self.proj(x)
+
+class DecoderHead(nn.Module):
+    def __init__(self, feature_channels=[112, 224, 448, 896], embedding_dim=256, output_dim=1):
+        super().__init__()
+        
+        # MLP layers to unify channel dimensions
+        self.linear_c4 = MLP(input_dim=feature_channels[3], embed_dim=embedding_dim)
+        self.linear_c3 = MLP(input_dim=feature_channels[2], embed_dim=embedding_dim)
+        self.linear_c2 = MLP(input_dim=feature_channels[1], embed_dim=embedding_dim)
+        self.linear_c1 = MLP(input_dim=feature_channels[0], embed_dim=embedding_dim)
+        
+        # Fuse
+        self.linear_fuse = nn.Conv2d(embedding_dim*4, embedding_dim, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(embedding_dim)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # Predict
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Conv2d(embedding_dim, output_dim, kernel_size=1)
+
+    def forward(self, features):
+        c1, c2, c3, c4 = features
+        
+        n, _, h, w = c4.shape
+        
+        # Hiera features are channel-last? No, timm usually outputs BCHW if features_only=True?
+        # Actually Hiera implementation in timm might return BCHW.
+        # Let's verify in forward. Assume BCHW for now based on previous check output `torch.Size([1, 112, 56, 56])`.
+        
+        # Resize to C1 size (which is H/4)
+        _c4 = self.linear_c4(c4.flatten(2).transpose(1, 2)).transpose(1, 2).view(n, -1, c4.shape[2], c4.shape[3])
+        _c4 = F.interpolate(_c4, size=c1.shape[2:], mode='bilinear', align_corners=False)
+
+        _c3 = self.linear_c3(c3.flatten(2).transpose(1, 2)).transpose(1, 2).view(n, -1, c3.shape[2], c3.shape[3])
+        _c3 = F.interpolate(_c3, size=c1.shape[2:], mode='bilinear', align_corners=False)
+
+        _c2 = self.linear_c2(c2.flatten(2).transpose(1, 2)).transpose(1, 2).view(n, -1, c2.shape[2], c2.shape[3])
+        _c2 = F.interpolate(_c2, size=c1.shape[2:], mode='bilinear', align_corners=False)
+
+        _c1 = self.linear_c1(c1.flatten(2).transpose(1, 2)).transpose(1, 2).view(n, -1, c1.shape[2], c1.shape[3])
+
+        _c = self.linear_fuse(torch.cat([_c4, _c3, _c2, _c1], dim=1))
+        _c = self.bn(_c)
+        _c = self.relu(_c)
+        
+        x = self.dropout(_c)
+        x = self.classifier(x)
+
+        return x
+
+
+class RefinerBlock(nn.Module):
+    """
+    Residual Block with Dilation and GroupNorm (Safe for Batch Size 2).
+    """
+    def __init__(self, channels, dilation=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
+        self.gn1 = nn.GroupNorm(8, channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
+        self.gn2 = nn.GroupNorm(8, channels)
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.gn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.gn2(out)
+        out += residual
+        out = self.relu(out)
+        return out
+
+class CNNRefinerModule(nn.Module):
+    """
+    Dilated Residual Refiner (Receptive Field ~65px).
+    designed to solve Macroblocking artifacts from Hiera.
+    Structure: Stem -> Res(d1) -> Res(d2) -> Res(d4) -> Res(d8) -> Projection.
+    """
+    def __init__(self, in_channels=7, hidden_channels=64, out_channels=4):
+        super().__init__()
+        
+        # Stem
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(8, hidden_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Dilated Residual Blocks (RF Expansion)
+        self.res1 = RefinerBlock(hidden_channels, dilation=1)
+        self.res2 = RefinerBlock(hidden_channels, dilation=2)
+        self.res3 = RefinerBlock(hidden_channels, dilation=4)
+        self.res4 = RefinerBlock(hidden_channels, dilation=8)
+        
+        # Final Projection (No Activation, purely additive logits)
+        self.final = nn.Conv2d(hidden_channels, out_channels, kernel_size=1)
+        
+        # Tiny Noise Init (Whisper) - Provides gradients without shock
+        nn.init.normal_(self.final.weight, mean=0.0, std=1e-3)
+        nn.init.constant_(self.final.bias, 0)
+
+    def forward(self, img, coarse_pred):
+        # img: [B, 3, H, W]
+        # coarse_pred: [B, 4, H, W]
+        x = torch.cat([img, coarse_pred], dim=1)
+        
+        x = self.stem(x)
+        x = self.res1(x)
+        x = self.res2(x)
+        x = self.res3(x)
+        x = self.res4(x)
+        
+        # Output Scaling (10x Boost)
+        # Allows the Refiner to predict small stable values (e.g. 0.5) that become strong corrections (5.0).
+        return self.final(x) * 10.0
+
+
+
+class GreenFormer(nn.Module):
+    def __init__(self, encoder_name='hiera_base_plus_224.mae_in1k_ft_in1k', in_channels=4, img_size=512, use_refiner=True):
+        super().__init__()
+        
+        # --- Encoder ---
+        # Load Pretrained Hiera
+        # 1. Create Target Model (512x512, Random Weights)
+        # We use features_only=True, which wraps it in FeatureGetterNet
+        print(f"Initializing {encoder_name} (img_size={img_size})...")
+        self.encoder = timm.create_model(encoder_name, pretrained=False, features_only=True, img_size=img_size)
+        
+        # ENABLE GRADIENT CHECKPOINTING
+        # This is critical for 2048x2048 training
+        try:
+            self.encoder.model.set_grad_checkpointing(True)
+            print("Gradient Checkpointing Enabled.")
+        except Exception as e:
+            print(f"Warning: Could not enable Gradient Checkpointing: {e}")
+        
+        # 2. Load Source Weights (224x224)
+        print(f"Loading pretrained weights to resize PosEmbed...")
+        # We load a standard model to get the clean state_dict
+        src_model = timm.create_model(encoder_name, pretrained=True, img_size=224)
+        state_dict = src_model.state_dict()
+        if 'pos_embed' in state_dict:
+            # Resize PosEmbed (Bicubic + Dampening) as requested
+            pos_embed = state_dict['pos_embed'] # [1, N, C]
+            N = pos_embed.shape[1]
+            C = pos_embed.shape[2]
+            
+            # Assume constant patch size (Hiera default stride is 4 for patch_embed)
+            grid_size = int(math.sqrt(N))
+            print(f"Resizing PosEmbed from {grid_size}x{grid_size} to {img_size//4}x{img_size//4}...")
+            
+            # 1. Calc Stats of Original
+            orig_mean = pos_embed.mean()
+            orig_std = pos_embed.std()
+            print(f"Original PosEmbed Stats: Mean={orig_mean:.4f}, Std={orig_std:.4f}")
+
+            # Reshape to [1, C, H, W] for interpolate
+            pos_embed = pos_embed.permute(0, 2, 1).view(1, C, grid_size, grid_size)
+            
+            # Target Grid
+            target_grid = img_size // 4
+            
+            # 2. Bicubic Interpolation (Smoother than Bilinear for 36x upsample)
+            pos_embed = F.interpolate(pos_embed, size=(target_grid, target_grid), mode='bicubic', align_corners=False)
+            
+            # 3. Dampening Strategy (User: "Limit output")
+            # A. Clamp to specific sigma range (Kill Spikes)
+            limit = 3.0 * orig_std
+            pos_embed = torch.clamp(pos_embed, orig_mean - limit, orig_mean + limit)
+            
+            # B. Global Scaling (Reduce Influence)
+            pos_embed = pos_embed * 0.5 
+            
+            print(f"Resized PosEmbed Dampened: Clamped to +/- {limit:.4f}, Scaled by 0.5")
+
+            # Reshape back to [1, N_new, C]
+            pos_embed = pos_embed.flatten(2).transpose(1, 2)
+            
+            state_dict['pos_embed'] = pos_embed
+        
+        # 4. Load into Encoder
+        # Because self.encoder is FeatureGetterNet, keys might need 'model.' prefix
+        # We check one key to see.
+        encoder_keys = list(self.encoder.state_dict().keys())
+        if encoder_keys[0].startswith('model.'):
+            # Prefix keys
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                new_state_dict[f"model.{k}"] = v
+            state_dict = new_state_dict
+            
+        keys = self.encoder.load_state_dict(state_dict, strict=False)
+        print(f"Weights Loaded. Missing: {len(keys.missing_keys)}, Unexpected: {len(keys.unexpected_keys)}")
+        
+        # Patch First Layer for 4 channels
+        if in_channels != 3:
+            self._patch_input_layer(in_channels)
+            
+        # Get feature info
+        # Verified Hiera Base Plus channels: [112, 224, 448, 896]
+        # We can try to fetch dynamically
+        try:
+            feature_channels = self.encoder.feature_info.channels()
+        except:
+            feature_channels = [112, 224, 448, 896]
+        print(f"Feature Channels: {feature_channels}")
+        
+        # --- Decoders ---
+        embedding_dim = 256
+        
+        # Alpha Decoder (Outputs 1 channel)
+        self.alpha_decoder = DecoderHead(feature_channels, embedding_dim, output_dim=1)
+        
+        # Foreground Decoder (Outputs 3 channels)
+        self.fg_decoder = DecoderHead(feature_channels, embedding_dim, output_dim=3)
+
+        # PointRend Module
+        # Fine Features: Input Image (4ch)
+        # Coarse Features: Coarse Prediction (4ch)
+        # Total In Features: 8
+        # --- Refiner (New) ---
+        # CNN Refiner instead of PointRend
+        # In Channels: 3 (RGB) + 4 (Coarse Pred) = 7
+        self.use_refiner = use_refiner
+        if self.use_refiner:
+            self.refiner = CNNRefinerModule(in_channels=7, hidden_channels=64, out_channels=4)
+        else:
+            self.refiner = None
+            print("Refiner Module DISABLED (Backbone Only Mode).")
+
+    def _patch_input_layer(self, in_channels):
+        """
+        Modifies the first convolution layer to accept `in_channels`.
+        Copies existing RGB weights and initializes extras to zero.
+        """
+        # Hiera: self.encoder.model.patch_embed.proj
+        
+        try:
+            patch_embed = self.encoder.model.patch_embed.proj
+        except AttributeError:
+             # Fallback if timm changes structure or for other models
+            patch_embed = self.encoder.patch_embed.proj
+        weight = patch_embed.weight.data # [Out, 3, K, K]
+        bias = patch_embed.bias.data if patch_embed.bias is not None else None
+        
+        new_in_channels = in_channels
+        out_channels, _, k, k = weight.shape
+        
+        # Create new conv
+        new_conv = nn.Conv2d(new_in_channels, out_channels, kernel_size=k, stride=patch_embed.stride, padding=patch_embed.padding, bias=(bias is not None))
+        
+        # Copy weights
+        new_conv.weight.data[:, :3, :, :] = weight
+        # Initialize new channels to 0 (Weight Patching)
+        new_conv.weight.data[:, 3:, :, :] = 0.0
+        
+        if bias is not None:
+            new_conv.bias.data = bias
+            
+        # Replace in module
+        try:
+             self.encoder.model.patch_embed.proj = new_conv
+        except AttributeError:
+             self.encoder.patch_embed.proj = new_conv
+        
+        print(f"Patched input layer: 3 channels -> {in_channels} channels (Extra initialized to 0)")
+
+    def forward(self, x):
+        # x: [B, 4, H, W]
+        input_size = x.shape[2:]
+        
+        # Encode
+        features = self.encoder(x) # Returns list of features
+        
+        # Decode Streams
+        alpha_logits = self.alpha_decoder(features) # [B, 1, H/4, W/4]
+        fg_logits = self.fg_decoder(features)       # [B, 3, H/4, W/4]
+        
+        # Upsample to full resolution (Bilinear)
+        # These are the "Coarse" LOGITS
+        alpha_logits_up = F.interpolate(alpha_logits, size=input_size, mode='bilinear', align_corners=False)
+        fg_logits_up = F.interpolate(fg_logits, size=input_size, mode='bilinear', align_corners=False)
+        
+        # --- HUMILITY CLAMP REMOVED (Phase 3) ---
+        # User requested NO CLAMPING to preserve all backbone detail.
+        # Refiner sees raw logits (-inf to +inf).
+        # alpha_logits_up = torch.clamp(alpha_logits_up, -3.0, 3.0)
+        # fg_logits_up = torch.clamp(fg_logits_up, -3.0, 3.0)
+        
+        # Coarse Probs (for Loss and Refiner Input)
+        alpha_coarse = torch.sigmoid(alpha_logits_up)
+        fg_coarse = torch.sigmoid(fg_logits_up)
+        
+        # --- Refinement (CNN Hybrid) ---
+        # 4. Refine (CNN)
+        # Input to refiner: RGB Image (first 3 channels of x) + Coarse Predictions (Probs)
+        # We give the refiner 'Probs' as input features because they are normalized [0,1]
+        rgb = x[:, :3, :, :]
+        
+        # CRITICAL STABILITY FIX: Detach Coarse Preds
+        # We prevent the Refiner from back-propagating to the Backbone via the input.
+        # This stops them from entering an "Adversarial Feedback Loop".
+        # The Refiner must simply fix what the Backbone gives it.
+        coarse_pred = torch.cat([alpha_coarse, fg_coarse], dim=1).detach() # [B, 4, H, W]
+        
+        # Refiner outputs DELTA LOGITS
+        # The refiner predicts the correction in valid score space (-inf, inf)
+        if self.use_refiner and self.refiner is not None:
+            delta_logits = self.refiner(rgb, coarse_pred)
+        else:
+            # Zero Deltas
+            delta_logits = torch.zeros_like(coarse_pred)
+        
+        delta_alpha = delta_logits[:, 0:1]
+        delta_fg = delta_logits[:, 1:4]
+        
+        # Residual Addition in Logit Space
+        # This allows infinite correction capability and prevents saturation blocking
+        alpha_final_logits = alpha_logits_up + delta_alpha
+        fg_final_logits = fg_logits_up + delta_fg
+        
+        # Final Activation
+        alpha_final = torch.sigmoid(alpha_final_logits)
+        fg_final = torch.sigmoid(fg_final_logits)
+        
+        return {
+            'alpha': alpha_final,      # Loss computes on this (Refined)
+            'fg': fg_final,            # Loss computes on this (Refined)
+            'alpha_coarse': alpha_coarse,
+            'fg_coarse': fg_coarse,
+            'delta_alpha': delta_alpha,
+            'delta_fg': delta_fg
+        }
+
+    @torch.no_grad()
+    def predict_fine(self, x):
+        """
+        Alias for forward() since we now run full-res refinement in a single pass.
+        Kept for compatibility with inference scripts.
+        """
+        return self.forward(x)
+if __name__ == "__main__":
+    from src.loss import calculate_uncertainty # Fix import if needed, or redefine
+    # Actually calculate_uncertainty is in src.point_rend
+    # We need to import it at top of file
+    model = GreenFormer()
+    x = torch.randn(2, 4, 1024, 1024) # Test 1024
+    # Mock point_rend
+    # ...
+
+if __name__ == "__main__":
+    model = GreenFormer()
+    x = torch.randn(2, 4, 512, 512)
+    out = model(x)
+    print("Alpha Shape:", out['alpha'].shape)
+    print("FG Shape:", out['fg'].shape)
