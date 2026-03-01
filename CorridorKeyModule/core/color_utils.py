@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import functools
+from collections.abc import Callable
+
+import cv2
 import numpy as np
 import torch
 
@@ -8,19 +12,48 @@ def _is_tensor(x: np.ndarray | torch.Tensor) -> bool:
     return isinstance(x, torch.Tensor)
 
 
+def _if_tensor(is_tensor: bool, tensor_func: Callable, numpy_func: Callable) -> Callable:
+    return tensor_func if is_tensor else numpy_func
+
+
+def _power(x: np.ndarray | torch.Tensor, exponent: float) -> np.ndarray | torch.Tensor:
+    """
+    Power function that supports both Numpy arrays and PyTorch tensors.
+    """
+    power = _if_tensor(_is_tensor(x), torch.pow, np.power)
+    return power(x, exponent)
+
+
+def _where(condition: bool, x: np.ndarray | torch.Tensor, y: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
+    """
+    Where function that supports both Numpy arrays and PyTorch tensors.
+    """
+    where = _if_tensor(_is_tensor(x), torch.where, np.where)
+    return where(condition, x, y)
+
+
+def _clamp(x: np.ndarray | torch.Tensor, min: float) -> np.ndarray | torch.Tensor:
+    """
+    Clamp function that supports both Numpy arrays and PyTorch tensors.
+    """
+    if _is_tensor(x):
+        return x.clamp(min=0.0)
+    else:
+        return np.clip(x, 0.0, None)
+
+
+_torch_stack = functools.partial(torch.stack, dim=-1)
+_numpy_stack = functools.partial(np.stack, axis=-1)
+
+
 def linear_to_srgb(x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
     """
     Converts Linear to sRGB using the official piecewise sRGB transfer function.
     Supports both Numpy arrays and PyTorch tensors.
     """
-    if _is_tensor(x):
-        x = x.clamp(min=0.0)
-        mask = x <= 0.0031308
-        return torch.where(mask, x * 12.92, 1.055 * torch.pow(x, 1.0 / 2.4) - 0.055)
-    else:
-        x = np.clip(x, 0.0, None)
-        mask = x <= 0.0031308
-        return np.where(mask, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055)
+    x = _clamp(x, 0.0)
+    mask = x <= 0.0031308
+    return _where(mask, x * 12.92, 1.055 * _power(x, 1.0 / 2.4) - 0.055)
 
 
 def srgb_to_linear(x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
@@ -28,14 +61,9 @@ def srgb_to_linear(x: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
     Converts sRGB to Linear using the official piecewise sRGB transfer function.
     Supports both Numpy arrays and PyTorch tensors.
     """
-    if _is_tensor(x):
-        x = x.clamp(min=0.0)
-        mask = x <= 0.04045
-        return torch.where(mask, x / 12.92, torch.pow((x + 0.055) / 1.055, 2.4))
-    else:
-        x = np.clip(x, 0.0, None)
-        mask = x <= 0.04045
-        return np.where(mask, x / 12.92, np.power((x + 0.055) / 1.055, 2.4))
+    x = _clamp(x, 0.0)
+    mask = x <= 0.04045
+    return _where(mask, x / 12.92, _power((x + 0.055) / 1.055, 2.4))
 
 
 def premultiply(fg: np.ndarray | torch.Tensor, alpha: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
@@ -54,10 +82,7 @@ def unpremultiply(
     Un-premultiplies foreground by alpha.
     Ref: fg_straight = fg_premul / (alpha + eps)
     """
-    if _is_tensor(fg):
-        return fg / (alpha + eps)
-    else:
-        return fg / (alpha + eps)
+    return fg / (alpha + eps)
 
 
 def composite_straight(
@@ -126,16 +151,18 @@ def dilate_mask(mask: np.ndarray | torch.Tensor, radius: int) -> np.ndarray | to
     if radius <= 0:
         return mask
 
+    kernel_size = int(radius * 2 + 1)
+
     if _is_tensor(mask):
         # PyTorch Dilation (using Max Pooling)
         # Expects [B, C, H, W]
         orig_dim = mask.dim()
+
         if orig_dim == 2:
             mask = mask.unsqueeze(0).unsqueeze(0)
         elif orig_dim == 3:
             mask = mask.unsqueeze(0)
 
-        kernel_size = int(radius * 2 + 1)
         padding = radius
         dilated = torch.nn.functional.max_pool2d(mask, kernel_size, stride=1, padding=padding)
 
@@ -148,7 +175,6 @@ def dilate_mask(mask: np.ndarray | torch.Tensor, radius: int) -> np.ndarray | to
         # Numpy Dilation (using OpenCV)
         import cv2
 
-        kernel_size = int(radius * 2 + 1)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         return cv2.dilate(mask, kernel)
 
@@ -170,10 +196,9 @@ def apply_garbage_matte(
     if _is_tensor(predicted_matte):
         # Handle broadcasting if needed
         pass
-    else:
+    elif garbage_mask.ndim == 2 and predicted_matte.ndim == 3:
         # Numpy
-        if garbage_mask.ndim == 2 and predicted_matte.ndim == 3:
-            garbage_mask = garbage_mask[:, :, np.newaxis]
+        garbage_mask = garbage_mask[:, :, np.newaxis]
 
     return predicted_matte * garbage_mask
 
@@ -190,50 +215,36 @@ def despill(
     if strength <= 0.0:
         return image
 
-    if _is_tensor(image):
+    tensor = _is_tensor(image)
+    _maximum = _if_tensor(tensor, torch.max, np.maximum)
+    _stack = _if_tensor(tensor, _torch_stack, _numpy_stack)
+
+    r = image[..., 0]
+    g = image[..., 1]
+    b = image[..., 2]
+
+    if green_limit_mode == "max":
+        limit = _maximum(r, b)
+    else:
+        limit = (r + b) / 2.0
+
+    if tensor:
         # PyTorch Impl
-        r = image[..., 0]
-        g = image[..., 1]
-        b = image[..., 2]
-
-        if green_limit_mode == "max":
-            limit = torch.max(r, b)
-        else:
-            limit = (r + b) / 2.0
-
         spill_amount = torch.clamp(g - limit, min=0.0)
-
-        g_new = g - spill_amount
-        r_new = r + (spill_amount * 0.5)
-        b_new = b + (spill_amount * 0.5)
-
-        despilled = torch.stack([r_new, g_new, b_new], dim=-1)
-
-        if strength < 1.0:
-            return image * (1.0 - strength) + despilled * strength
-        return despilled
     else:
         # Numpy Impl
-        r = image[..., 0]
-        g = image[..., 1]
-        b = image[..., 2]
-
-        if green_limit_mode == "max":
-            limit = np.maximum(r, b)
-        else:
-            limit = (r + b) / 2.0
-
         spill_amount = np.maximum(g - limit, 0.0)
 
-        g_new = g - spill_amount
-        r_new = r + (spill_amount * 0.5)
-        b_new = b + (spill_amount * 0.5)
+    g_new = g - spill_amount
+    r_new = r + (spill_amount * 0.5)
+    b_new = b + (spill_amount * 0.5)
 
-        despilled = np.stack([r_new, g_new, b_new], axis=-1)
+    despilled = _stack([r_new, g_new, b_new])
 
-        if strength < 1.0:
-            return image * (1.0 - strength) + despilled * strength
-        return despilled
+    if strength < 1.0:
+        return image * (1.0 - strength) + despilled * strength
+
+    return despilled
 
 
 def clean_matte(alpha_np: np.ndarray, area_threshold: int = 300, dilation: int = 15, blur_size: int = 5) -> np.ndarray:
@@ -241,9 +252,6 @@ def clean_matte(alpha_np: np.ndarray, area_threshold: int = 300, dilation: int =
     Cleans up small disconnected components (like tracking markers) from a predicted alpha matte.
     alpha_np: Numpy array [H, W] or [H, W, 1] float (0.0 - 1.0)
     """
-    import cv2
-    import numpy as np
-
     # Needs to be 2D
     is_3d = False
     if alpha_np.ndim == 3:
@@ -294,8 +302,6 @@ def create_checkerboard(
     Creates a linear grayscale checkerboard pattern.
     Returns: Numpy array [H, W, 3] float (0.0-1.0)
     """
-    import numpy as np
-
     # Create coordinate grids
     x = np.arange(width)
     y = np.arange(height)
