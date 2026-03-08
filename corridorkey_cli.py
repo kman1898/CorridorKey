@@ -298,8 +298,25 @@ def main() -> None:
         default="auto",
         help="Compute device (default: auto-detect CUDA > MPS > CPU)",
     )
+    parser.add_argument(
+        "--frame-start",
+        type=int,
+        default=None,
+        help="First frame to process, 0-indexed inclusive (default: start of clip). "
+             "Use with --frame-end to process a range, e.g. for multi-machine distribution.",
+    )
+    parser.add_argument(
+        "--frame-end",
+        type=int,
+        default=None,
+        help="Last frame to process, 0-indexed inclusive (default: end of clip). "
+             "Use with --frame-start to process a range, e.g. for multi-machine distribution.",
+    )
 
     args = parser.parse_args()
+
+    if (args.frame_start is None) != (args.frame_end is None):
+        parser.error("--frame-start and --frame-end must be used together.")
 
     device = resolve_device(args.device)
     logger.info(f"Using device: {device}")
@@ -312,7 +329,7 @@ def main() -> None:
             generate_alphas(clips, device=device)
         elif args.action == "run_inference":
             clips = scan_clips()
-            run_inference(clips, device=device)
+            run_inference(clips, device=device, frame_start=args.frame_start, frame_end=args.frame_end)
         elif args.action == "wizard":
             if not args.win_path:
                 print("Error: --win_path required for wizard.")

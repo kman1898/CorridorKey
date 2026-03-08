@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import glob
 import logging
 import os
@@ -495,7 +496,66 @@ def run_videomama(clips: list[ClipEntry], chunk_size: int = 50, device: str | No
             traceback.print_exc()
 
 
-def run_inference(clips, device=None, backend=None, max_frames=None):
+def _write_frame_outputs(
+    res: dict,
+    input_stem: str,
+    fg_dir: str,
+    matte_dir: str,
+    comp_dir: str,
+    proc_dir: str,
+    exr_flags: list,
+) -> None:
+    """Write all output passes for a single frame to disk.
+
+    Runs in a background thread so the GPU inference loop is not blocked by
+    disk I/O. All arrays in `res` are freshly allocated by process_frame()
+    on each call, so no copying is required before handing them off.
+    """
+    pred_fg = res["fg"]      # sRGB float
+    pred_alpha = res["alpha"]  # Linear float
+
+    # Save FG (RGB -> BGR for OpenCV)
+    fg_bgr = cv2.cvtColor(pred_fg, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(os.path.join(fg_dir, f"{input_stem}.exr"), fg_bgr, exr_flags)
+
+    # Save Matte (single-channel linear float)
+    if pred_alpha.ndim == 3:
+        pred_alpha = pred_alpha[:, :, 0]
+    cv2.imwrite(os.path.join(matte_dir, f"{input_stem}.exr"), pred_alpha, exr_flags)
+
+    # Save Comp (PNG 8-bit sRGB preview)
+    comp_srgb = res["comp"]
+    comp_bgr = cv2.cvtColor((np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    cv2.imwrite(os.path.join(comp_dir, f"{input_stem}.png"), comp_bgr)
+
+    # Save Processed RGBA EXR (linear premul)
+    if "processed" in res:
+        proc_rgba = res["processed"]
+        proc_bgra = cv2.cvtColor(proc_rgba, cv2.COLOR_RGBA2BGRA)
+        cv2.imwrite(os.path.join(proc_dir, f"{input_stem}.exr"), proc_bgra, exr_flags)
+
+
+def run_inference(clips, device=None, backend=None, max_frames=None, frame_start=None, frame_end=None):
+    """Run CorridorKey inference on a list of ready clips.
+
+    Args:
+        clips: List of ClipEntry objects to process.
+        device: Compute device string ("cuda", "mps", "cpu", or None for auto).
+        backend: Inference backend ("torch", "mlx", or None for auto).
+        max_frames: Cap on frames processed per clip (for testing).
+        frame_start: First frame index to process, 0-indexed inclusive.
+                     None means start from the beginning of the clip.
+        frame_end: Last frame index to process, 0-indexed inclusive.
+                   None means process to the end of the clip.
+
+    Notes on frame_start / frame_end:
+        - Both must be provided together or both omitted.
+        - Useful for splitting a single clip across multiple machines:
+          machine A runs --frame-start 0 --frame-end 499,
+          machine B runs --frame-start 500 --frame-end 999, etc.
+        - Output filenames are based on input frame stem names so results
+          from different ranges land consistently in the same Output/ folder.
+    """
     ready_clips = [c for c in clips if c.input_asset and c.alpha_asset]
 
     if not ready_clips:
@@ -584,12 +644,26 @@ def run_inference(clips, device=None, backend=None, max_frames=None):
         num_frames = min(clip.input_asset.frame_count, clip.alpha_asset.frame_count)
         if max_frames is not None:
             num_frames = min(num_frames, max_frames)
+
+        # Resolve frame range — supports splitting a clip across multiple machines
+        range_start = int(frame_start) if frame_start is not None else 0
+        range_end = int(frame_end) if frame_end is not None else num_frames - 1
+        range_end = min(range_end, num_frames - 1)
+
+        if range_start > range_end:
+            logger.warning(
+                f"Clip '{clip.name}': frame_start ({range_start}) > frame_end ({range_end}), skipping."
+            )
+            continue
+
+        range_count = range_end - range_start + 1
         logger.info(
             f"  Input frames: {clip.input_asset.frame_count},"
-            f" Alpha frames: {clip.alpha_asset.frame_count} -> Processing {num_frames} frames"
+            f" Alpha frames: {clip.alpha_asset.frame_count}"
+            f" -> Processing frames {range_start}-{range_end} ({range_count} frames)"
         )
 
-        if num_frames == 0:
+        if range_count == 0:
             logger.warning(f"Clip '{clip.name}': 0 frames to process, skipping.")
             continue
 
@@ -608,9 +682,24 @@ def run_inference(clips, device=None, backend=None, max_frames=None):
         else:
             alpha_files = sorted([f for f in os.listdir(clip.alpha_asset.path) if is_image_file(f)])
 
-        for i in range(num_frames):
-            if i % 10 == 0:
-                print(f"  Frame {i}/{num_frames}...", end="\r")
+        # EXR writes run in a background thread so the GPU is not stalled waiting
+        # for disk I/O. A queue depth of 4 is enough buffer for typical storage;
+        # if writes are slower than inference the executor will block naturally.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as write_executor:
+            write_futures = []
+
+            exr_flags = [
+                cv2.IMWRITE_EXR_TYPE,
+                cv2.IMWRITE_EXR_TYPE_HALF,
+                # DWAB fails. PXR24 verified as smallest working format (46KB vs ZIP 56KB vs B44A 688KB)
+                cv2.IMWRITE_EXR_COMPRESSION,
+                cv2.IMWRITE_EXR_COMPRESSION_PXR24,
+            ]
+
+            for i in range(range_start, range_end + 1):
+                display_i = i - range_start + 1
+                if display_i % 10 == 0 or display_i == 1:
+                    print(f"  Frame {display_i}/{range_count} (clip frame {i})...", end="\r")
 
             # 1. Read Input
             img_srgb = None
@@ -692,44 +781,30 @@ def run_inference(clips, device=None, backend=None, max_frames=None):
                 refiner_scale=refiner_scale,
             )
 
-            pred_fg = res["fg"]  # sRGB
-            pred_alpha = res["alpha"]  # Linear
+            # 4. Submit writes to background thread — GPU continues on next frame
+            # immediately. _write_frame_outputs() handles all four output passes.
+            # process_frame() allocates fresh arrays each call so no copy needed.
+            future = write_executor.submit(
+                _write_frame_outputs,
+                res,
+                input_stem,
+                fg_dir,
+                matte_dir,
+                comp_dir,
+                proc_dir,
+                exr_flags,
+            )
+            write_futures.append(future)
 
-            # 4. Save (EXR DWAB Half-Float)
+            # Limit in-flight write futures to avoid unbounded memory growth.
+            # If writes are slower than inference we block here until one slot opens.
+            if len(write_futures) >= 4:
+                done_future = write_futures.pop(0)
+                done_future.result()  # re-raises any write exception on the main thread
 
-            # Compression Params
-            exr_flags = [
-                cv2.IMWRITE_EXR_TYPE,
-                cv2.IMWRITE_EXR_TYPE_HALF,
-                # DWAB fails. PXR24 verified as smallest working format (46KB vs ZIP 56KB vs B44A 688KB)
-                cv2.IMWRITE_EXR_COMPRESSION,
-                cv2.IMWRITE_EXR_COMPRESSION_PXR24,
-            ]
-
-            # Save FG
-            # pred_fg is RGB 0-1 float. Convert to BGR for OpenCV
-            fg_bgr = cv2.cvtColor(pred_fg, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(fg_dir, f"{input_stem}.exr"), fg_bgr, exr_flags)
-
-            # Save Matte
-            if pred_alpha.ndim == 3:
-                pred_alpha = pred_alpha[:, :, 0]
-            # Matte is single channel linear float
-            cv2.imwrite(os.path.join(matte_dir, f"{input_stem}.exr"), pred_alpha, exr_flags)
-
-            # 5. Generate Reference Comp
-            comp_srgb = res["comp"]
-            # Save Comp (PNG 8-bit)
-            comp_bgr = cv2.cvtColor((np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(comp_dir, f"{input_stem}.png"), comp_bgr)
-
-            # 6. Save Processed (RGBA EXR)
-            if "processed" in res:
-                # Result is RGBA
-                proc_rgba = res["processed"]
-                # Convert to BGRA for OpenCV
-                proc_bgra = cv2.cvtColor(proc_rgba, cv2.COLOR_RGBA2BGRA)
-                cv2.imwrite(os.path.join(proc_dir, f"{input_stem}.exr"), proc_bgra, exr_flags)
+        # Drain remaining writes before releasing captures or moving to next clip
+        for future in write_futures:
+            future.result()
 
         print("")
         if input_cap:
